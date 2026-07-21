@@ -34,8 +34,8 @@ Repo layout (meta-repo at `OpenSlides/`, submodules initialized):
 - Default algorithm: **`"meek-nz"`**. Recorded inside `rank_result` (the
   `algorithm` id names the computational rules; the quota rule is configurable
   via `rank_quota` and recorded separately as `quota_rule`).
-- `pollmethod: "rank"` is allowed **only for assignment polls** and only for
-  electronic types (`named`, `pseudoanonymous`) — never `analog`.
+- `pollmethod: "rank"` is allowed **only for assignment polls**, for types
+  `named`, `pseudoanonymous`, and `analog` (paper-ballot entry, §9).
 - Seats = the assignment's `open_posts` at poll stop time (no separate poll field).
 - `onehundred_percent_base` must be `"disabled"` for rank polls.
 - `global_abstain` may be true (explicit abstain ballot); `global_yes`/`global_no`
@@ -225,8 +225,8 @@ pre-`quota_rule` results is needed; existing test polls can be discarded.
   (Meek STV)"; offered only in the **assignment** poll form.
 - Form (assignment-poll-form + base-poll-form): when rank is selected — hide
   min/max votes amount, max votes per option, global yes/no (keep global abstain
-  toggle), force `onehundred_percent_base: "disabled"`, disable live voting and
-  analog type. Additionally show two selects: **Counting algorithm**
+  toggle), force `onehundred_percent_base: "disabled"`, disable live voting
+  (the analog type is allowed — §9). Additionally show two selects: **Counting algorithm**
   (`rank_algorithm`: "Meek STV (New Zealand rules)" / "Scottish STV" /
   "Borda count", default meek-nz) and **Quota** (`rank_quota`: "Droop quota" /
   "Hare quota", default droop, hidden when borda is selected).
@@ -259,6 +259,16 @@ pre-`quota_rule` results is needed; existing test polls can be discarded.
   name; BLT stays voter-free (the format has no field for it). Anonymized or
   pseudoanonymous polls export without any voter data. Non-integer weights are written as-is in BLT (note: some
   third-party tools only accept integer weights).
+- Result PDFs (`poll-rank-result-pdf.service`, shared by the election PDF of
+  assignment-pdf.service and the single poll PDF of base-poll-pdf.service):
+  rank polls with a counted `rank_result` render the same block as the detail
+  page instead of the generic results table — elected candidates in order of
+  election, summary line, round-by-round tables (chunked to 5 rounds per table
+  so they fit the page width; candidates as rows with "elected/excluded
+  (Round n)" annotations, Meek keep factors below the vote values, exhausted
+  votes and quota rows) or the Borda points table, plus tie-break notes. The
+  error variant prints the error message followed by the generic
+  first-preference table. Other poll methods are unchanged.
 - Ballot papers PDF (assignment-poll-pdf.service, "Ballot papers" menu entry):
   for rank polls each ballot prints an instruction line ("Rank the candidates in
   order of preference: 1 for your first choice, …") followed by one empty
@@ -320,3 +330,142 @@ pre-`quota_rule` results is needed; existing test polls can be discarded.
   not lose ballots — ballots are persisted as Vote records before counting; if the
   counter raises, store the error (`rank_result = {"version":1, "error": "..."}`).
 - reset: clears `rank_result` along with existing vote-clearing behavior.
+
+## 9. Analog rank polls (paper STV ballot entry)
+
+Amends §1's former electronic-only restriction: `pollmethod: "rank"` is now also
+allowed with `type: "analog"`. A teller transcribes each paper ballot's ranking
+into the poll dialog (or imports a BLT/CSV file); the backend stores ballots in
+the **same Vote-record format as §3** and runs the **same counters (§4)** into
+the **same `rank_result` (§5)**, so the results page, projector slide, PDFs and
+exports work for analog rank polls with no changes. Single-teller entry (no
+double-entry verification in v1). No new model fields — no meta/migration work.
+
+### 9.1 Validation
+
+- All §1 rank rules apply unchanged to analog rank polls:
+  `onehundred_percent_base: "disabled"` (allowed for analog — only
+  entitled/entitled_present are barred), `global_yes`/`global_no` false,
+  `global_abstain` optional, `live_voting_enabled` false,
+  `rank_algorithm`/`rank_quota` as in §1.
+- Existing analog rules apply unchanged: no `entitled_group_ids`,
+  `publish_immediately` supported, `votescast`/`votesvalid`/`votesinvalid`
+  teller-entered (sentinel `-2` when undocumented).
+- The vote service is never involved (as for all analog polls).
+
+### 9.2 `rank_ballots` action payload (poll.create / poll.update)
+
+New **optional payload field** (action schema only, not a model field), allowed
+only when the poll is `analog` + `rank`:
+
+```json
+"rank_ballots": [
+  { "ranking": [3, 1, 2], "count": 3 },
+  { "ranking": [2], "count": 1 }
+]
+```
+
+- `ranking`: non-empty list of distinct **1-based candidate numbers in
+  ballot-paper order** (option weight order — the numbers printed on the
+  ballot papers and shown in the entry legend), most preferred first. Numbers
+  are used instead of option ids because at `poll.create` time the option ids
+  do not exist yet; the backend converts them to option ids (and stores the
+  §3 option-id JSON maps) so the stored format stays identical to the
+  electronic path. `count`: positive integer, default 1 — multiplicity for
+  identical ballots (BLT-style). Any invalid entry rejects the whole action.
+- **Replace-all semantics**: when the key is present, all existing Vote records
+  on the poll's global option are deleted and rewritten from the list.
+- Storage: one Vote record per entry on the global option, `value` = compact
+  JSON ranking map exactly as §3 (e.g. `{"12":1,"15":2,"9":3}`), `weight` =
+  count as 6-dp decimal string, user/delegated_user fields null (analog is
+  anonymous), no user_token.
+- **Abstain ballots are not entered in `rank_ballots`.** The teller uses the
+  existing `amount_global_abstain` number (requires `global_abstain`); the
+  existing analog machinery writes it to the global option's `abstain` field,
+  and the backend additionally synthesizes **one** Vote record `value = "A"`,
+  `weight = amount` (when amount > 0) so ballot reconstruction (§6 exports,
+  votes table) behaves identically to electronic rank polls. No aggregation
+  step runs for analog, so there is no double count.
+- Spoiled/unreadable paper ballots are **not transcribed** — the teller counts
+  them in `votesinvalid` as with any analog poll.
+
+### 9.3 Counting lifecycle ("save anytime, count on finish")
+
+- Vote records are persisted on **every** save, in any state — a teller can
+  save partial progress while the poll is still `created` without losing work.
+- `rank_ballots` is **not** added to `check_state_change`'s trigger fields:
+  a save containing only `rank_ballots` never auto-finishes the poll. The
+  existing trigger (totals fields while `created`) and `publish_immediately`
+  behave as today.
+- The count (counter per §4 → `rank_result` per §5; each option's `yes` =
+  weighted first-preference total; `abstain_weight` = amount_global_abstain)
+  runs whenever, after applying the action, the poll is analog+rank **and**
+  its state is `finished` or `published` — i.e. on the finishing save and on
+  any later edit of `rank_ballots` / `rank_algorithm` / `rank_quota` /
+  `amount_global_abstain` while finished/published (analog stays editable
+  after finish, as today; every such edit recounts and rewrites
+  `rank_result`). While `created`, `rank_result` stays null.
+- Implementation: factor the count-and-write block out of
+  `StopControl.on_stop` into a helper shared by the electronic stop path and
+  the analog create/update path.
+- Seats and seed as §3: `open_posts` at count time; a **fresh random seed per
+  count run** — re-saving an analog poll may re-roll a random tie-break (the
+  tie-break is recorded in `rounds`, so this is auditable).
+- Counter failure: same contract as §8 — ballots are already persisted; store
+  `rank_result = {"version":1, "error": "..."}`.
+- `poll.reset` clears vote records and `rank_result` (existing behavior).
+
+### 9.4 Client — entry UI in the analog poll dialog
+
+- Poll form (§6 amendment): the analog type is selectable for rank polls; the
+  algorithm/quota selects and global-abstain toggle are shown for analog too.
+- For analog rank polls the dialog replaces the Y/N/A number grid with a
+  **ballot entry block** (kept inside the existing dialog):
+  - **Candidate list**: the candidates displayed as a numbered list in
+    ballot-paper order (option weight order — identical to
+    `rank_result.candidates` order), exactly as they appear on the printed
+    ballot: "1 — Alice", "2 — Bob", ….
+  - **Ballot text box**: a single multiline textarea in which the teller
+    types the paper rankings, **one ballot per line**, as space/comma-
+    separated candidate indexes in preference order, e.g. `3 1 4`. Blank
+    lines are ignored. The textarea is parsed live: unknown or duplicate
+    indexes are flagged with their line number and block saving. Each valid
+    line becomes one §9.2 entry with `count: 1` (identical lines may be
+    coalesced into a higher count — semantically equivalent).
+  - **Abstain ballots** number input (bound to `amount_global_abstain`),
+    shown when `global_abstain`.
+  - Totals inputs (`votescast`/`votesvalid`/`votesinvalid`) as today, plus a
+    **non-blocking warning** when entered ballots + abstains ≠ votesvalid.
+  - A running tally: "N ballots entered (Σ weight), M abstains".
+  - **Import**: a button opening a **file upload** for **BLT** or **CSV**
+    (upload only — no paste field). The file is parsed client-side and its
+    ballots are written into the text box as ranking lines (a ballot with
+    weight/count N becomes N identical lines) so the teller reviews and can
+    edit before saving; parse errors are listed with line numbers and abort
+    the import; the teller chooses replace or append. Formats mirror the §6 exports so an exported file round-trips:
+    BLT — `n seats` header, ballot lines `weight idx… 0` with 1-based indexes
+    in legend order, terminating `0` and quoted names tolerated/ignored;
+    CSV — `choice_1..choice_k` columns with candidate names matched
+    case-insensitively, optional weight/count column, ballot/voter columns
+    ignored.
+  - **Draft saves**: there is no separate button — as with other analog
+    polls, the poll only auto-finishes when the totals fields are filled in.
+    Saving with empty totals persists the ballots and keeps the poll
+    `created`; a hint below the fields explains this. Entering the totals
+    (or checking publish immediately on a finished poll) finishes/publishes
+    as today.
+  - Re-opening the dialog reconstructs the text box from the poll's
+    global-option vote records — one ranking line per ballot, a count-N
+    record expanded to N identical lines ("A" record → abstain amount).
+- Detail page: the votes table lists analog rank ballots **anonymously**
+  (rendered "1. Carol · 2. Dave · …" as §6) for auditing against the paper
+  stack, following the existing state-based vote visibility. Results block,
+  projector slide, result PDFs and BLT/CSV/JSON exports work unchanged
+  (analog exports are voter-free, like pseudoanonymous).
+- Ballot papers PDF (§6): for rank polls, print the legend index before each
+  candidate name ("1 — Alice") so the printed paper matches the entry screen.
+
+### 9.5 Permissions
+
+Identical to existing analog vote entry: whoever may manage the poll may enter
+ballots. No autoupdate/vote-service changes.
